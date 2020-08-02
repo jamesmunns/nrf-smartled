@@ -1,6 +1,6 @@
 [package]
 name = "nrf-smartled"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Smart LED (WS2812) driver using hardware acceleration"
 repository = "https://github.com/jamesmunns/nrf-smartled"
 authors = ["James Munns <james.munns@ferrous-systems.com>"]

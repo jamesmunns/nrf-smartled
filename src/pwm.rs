@@ -1,3 +1,5 @@
+//! Smartleds using the PWM peripheral
+
 #[allow(unused)]
 use crate::hal;
 
@@ -86,6 +88,8 @@ where
         });
         pwm.seq0.refresh.write(|w| unsafe { w.bits(0) });
         pwm.seq0.enddelay.write(|w| unsafe { w.bits(0) });
+        pwm.seq1.refresh.write(|w| unsafe { w.bits(0) });
+        pwm.seq1.enddelay.write(|w| unsafe { w.bits(0) });
 
         Pwm { pwm, _gpio: pin }
     }
@@ -112,9 +116,32 @@ where
 
         self.pwm.seq0.ptr.write(|w| w.bits((*buf).as_ptr() as u32));
         self.pwm.seq0.cnt.write(|w| w.bits((*buf).len() as u32));
-
         self.pwm.events_seqend[0].write(|w| w.bits(0));
         self.pwm.tasks_seqstart[0].write(|w| w.bits(1));
+
+        Ok(())
+    }
+
+    /// Set the seq[1] register's ptr and length
+    ///
+    /// SAFETY: the contents of `buf` must live and me constant until sequence 1
+    /// is completed
+    pub unsafe fn set_seq1_raw(&mut self, buf: *const [u16]) -> Result<(), ()> {
+        // TODO: Check maximum supported len?
+        if (*buf).is_empty() {
+            return Err(());
+        }
+
+        if (((*buf).as_ptr() as usize) < hal::target_constants::SRAM_LOWER)
+            || (((*buf).as_ptr() as usize) > hal::target_constants::SRAM_UPPER)
+        {
+            return Err(());
+        }
+
+        compiler_fence(Ordering::SeqCst);
+
+        self.pwm.seq1.ptr.write(|w| w.bits((*buf).as_ptr() as u32));
+        self.pwm.seq1.cnt.write(|w| w.bits((*buf).len() as u32));
 
         Ok(())
     }
@@ -124,7 +151,7 @@ where
     /// Note: You probably shouldn't use this function unless you
     /// are also using Pwm::start_send_raw().
     pub fn is_done_raw(&self) -> bool {
-        self.pwm.events_seqend[0].read().bits() == 0
+        self.pwm.events_seqend[0].read().bits() == 1
     }
 
     /// Send a series of colors and a stop pattern, using a given scratch space
@@ -148,6 +175,9 @@ where
         for by in &mut scratch[start..end] {
             *by = 0x8000;
         }
+
+        // Disable looping, this is a one-shot
+        self.pwm.loop_.write(|w| w.cnt().disabled());
 
         // Safety: we block until the DMA transaction is complete
         unsafe {
@@ -189,58 +219,128 @@ where
         let mut buf_a = [0u16; 24];
         let mut buf_b = [0u16; 24];
 
+        let mut blanks_fed = 0;
         let mut toggle = false;
 
-        // Start by filling and starting buf_a
-        if let Some(c) = iterator.next() {
-            fill_buf(&c.into(), &mut buf_a)?;
-            unsafe {
-                self.start_send_raw(&mut buf_a)?;
+        match (iterator.next(), iterator.next()) {
+            (Some(a), Some(b)) => {
+                // Two pixels, fill to buffers
+                fill_buf(&a.into(), &mut buf_a);
+                fill_buf(&b.into(), &mut buf_b);
             }
-        } else {
-            return Ok(());
+            (Some(a), None) => {
+                // One pixel, fill the pixel and a blank
+                fill_buf(&a.into(), &mut buf_a);
+                buf_b.copy_from_slice(&[0x8000u16; 24]);
+                blanks_fed = 1;
+            }
+            (None, Some(_)) => {
+                // what? Intermittent iterator?
+                return Err(());
+            }
+            _ => {
+                // Empty iterator, nothing completed successfully
+                return Ok(());
+            }
         }
 
-        // Begin ping-ponging
-        for c in iterator {
-            let buf = if toggle { &mut buf_a } else { &mut buf_b };
+        unsafe {
+            // Set the back half, and set + start the front half
+            self.pwm.loop_.write(|w| unsafe { w.cnt().bits(1) });
+            self.pwm.events_loopsdone.write(|w| w.bits(0));
+            self.set_seq1_raw(&buf_b);
+            self.start_send_raw(&buf_a);
+        }
+
+        #[derive(Copy, Clone)]
+        enum Data {
+            Pixel(RGB8),
+            Blank,
+        }
+
+        // Create a new iterator that can contain pixels and blanks.
+        // We include three blanks to ensure that we always have
+        // enough to do a full A/B cycle, even if there are an
+        // odd number of LEDs.
+        //
+        // TODO: In the future, we could have slightly more complex
+        // code to skip the "extra" sequence by setting the loop
+        // count to zero
+        let new_iter = iterator
+            .map(|seq| Data::Pixel(seq.into()))
+            .chain([Data::Blank; 3].iter().cloned());
+
+        // Begin filling the rest of the LEDs, or any remaining
+        // blanks needed
+        for seq in new_iter {
+            if !toggle {
+                // We're currently on the "A" side, about to start the "B" side,
+                // and refill the "A" side data.
+
+                // wait until seq_end[0] to refill the data
+                while !self.is_done_raw() {}
+
+                // refill seq[0] data
+                match seq {
+                    Data::Pixel(p) => {
+                        fill_buf(&p, &mut buf_a);
+                    }
+                    Blank => {
+                        buf_a.copy_from_slice(&[0x8000u16; 24]);
+                        blanks_fed += 1;
+                    }
+                }
+
+                compiler_fence(Ordering::SeqCst);
+            } else {
+                // We're currently on the "B" side, waiting to restart the
+                // sequence, then refill the "B" side data
+
+                // If we are **here**, this means:
+                // 0 blanks: We haven't filled ANY blanks, might still
+                //   have more LEDs or not
+                // 1 blanks: We've filled the A side with the first blank.
+                //   we still need to start the seq and fill the B side
+                //   with a blank.
+                // 2 blanks: We've sent a blank in B before, and loaded
+                //   one into the pending "A" side, but we still
+                //   need to launch A to fire the last blank.
+                // > 2 blanks: Shouldn't happen.
+
+                // wait until the A+B loop is done
+                while self.pwm.events_loopsdone.read().bits() == 0 {}
+
+                // start seq[0] as quickly as possible
+                unsafe {
+                    self.pwm.tasks_seqstart[0].write(|w| w.bits(1));
+                    self.pwm.events_seqend[0].write(|w| w.bits(0));
+                    self.pwm.events_loopsdone.write(|w| w.bits(0));
+                }
+
+                compiler_fence(Ordering::SeqCst);
+
+                // refill seq[1] data
+                match seq {
+                    Data::Pixel(p) => {
+                        fill_buf(&p, &mut buf_b);
+                    }
+                    Blank => {
+                        buf_b.copy_from_slice(&[0x8000u16; 24]);
+                        blanks_fed += 1;
+                    }
+                }
+                compiler_fence(Ordering::SeqCst);
+
+                // We've filled at least two blanks
+                if blanks_fed >= 2 {
+                    break;
+                }
+            }
             toggle = !toggle;
-
-            // Proactively fill the next buffer
-            fill_buf(&c.into(), buf)?;
-
-            // Wait for the last buffer to complete
-            while !self.is_done_raw() {}
-
-            // Begin sending the next buffer
-            unsafe {
-                self.start_send_raw(buf)?;
-            }
         }
 
-        let buf = if toggle {
-            &mut buf_a[..20]
-        } else {
-            &mut buf_b[..20]
-        };
-
-        // Fill buffers with zeros to force a quiet period
-        buf.iter_mut().for_each(|x| *x = 0x8000);
-
-        // Finish sending last pixel
-        while !self.is_done_raw() {}
-
-        // Send 1/2 of reset period
-        unsafe {
-            self.start_send_raw(buf)?;
-        }
-        while !self.is_done_raw() {}
-
-        // Send 2/2 of reset period
-        unsafe {
-            self.start_send_raw(buf)?;
-        }
-        while !self.is_done_raw() {}
+        // Wait until the last loop is done
+        while self.pwm.events_loopsdone.read().bits() == 0 {}
 
         Ok(())
     }
