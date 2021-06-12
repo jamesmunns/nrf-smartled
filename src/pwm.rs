@@ -224,13 +224,13 @@ where
 
         match (iterator.next(), iterator.next()) {
             (Some(a), Some(b)) => {
-                // Two pixels, fill to buffers
-                fill_buf(&a.into(), &mut buf_a);
-                fill_buf(&b.into(), &mut buf_b);
+                // Two pixels, fill two buffers
+                fill_buf(&a.into(), &mut buf_a)?;
+                fill_buf(&b.into(), &mut buf_b)?;
             }
             (Some(a), None) => {
                 // One pixel, fill the pixel and a blank
-                fill_buf(&a.into(), &mut buf_a);
+                fill_buf(&a.into(), &mut buf_a)?;
                 buf_b.copy_from_slice(&[0x8000u16; 24]);
                 blanks_fed = 1;
             }
@@ -246,10 +246,10 @@ where
 
         unsafe {
             // Set the back half, and set + start the front half
-            self.pwm.loop_.write(|w| unsafe { w.cnt().bits(1) });
+            self.pwm.loop_.write(|w| w.cnt().bits(1));
             self.pwm.events_loopsdone.write(|w| w.bits(0));
-            self.set_seq1_raw(&buf_b);
-            self.start_send_raw(&buf_a);
+            self.set_seq1_raw(&buf_b)?;
+            self.start_send_raw(&buf_a)?;
         }
 
         #[derive(Copy, Clone)]
@@ -283,9 +283,9 @@ where
                 // refill seq[0] data
                 match seq {
                     Data::Pixel(p) => {
-                        fill_buf(&p, &mut buf_a);
+                        fill_buf(&p, &mut buf_a)?;
                     }
-                    Blank => {
+                    Data::Blank => {
                         buf_a.copy_from_slice(&[0x8000u16; 24]);
                         blanks_fed += 1;
                     }
@@ -322,9 +322,9 @@ where
                 // refill seq[1] data
                 match seq {
                     Data::Pixel(p) => {
-                        fill_buf(&p, &mut buf_b);
+                        fill_buf(&p, &mut buf_b)?;
                     }
-                    Blank => {
+                    Data::Blank => {
                         buf_b.copy_from_slice(&[0x8000u16; 24]);
                         blanks_fed += 1;
                     }
